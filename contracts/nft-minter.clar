@@ -1,0 +1,147 @@
+;; nft-minter.clar
+(define-constant CONTRACT-OWNER tx-sender)
+(define-constant ERR-NOT-AUTHORIZED (err u300))
+(define-constant ERR-INSUFFICIENT-PAYMENT (err u301))
+(define-constant ERR-INVALID-TIER (err u302))
+(define-constant ERR-NFT-NOT-FOUND (err u303))
+(define-constant ERR-ALREADY-OWNED (err u304))
+(define-constant ERR-ROYALTY-TRANSFER-FAILED (err u305))
+(define-constant ERR-TIER-SOLD-OUT (err u306))
+(define-constant ERR-MAX-SUPPLY-REACHED (err u307))
+
+(define-data-var fund-disbursement-contract principal tx-sender)
+(define-data-var royalty-recipient principal tx-sender)
+(define-data-var next-nft-id uint u0)
+(define-data-var base-uri (string-ascii 80) "ipfs://Qm.../")
+
+(define-map nfts uint { owner: principal, tier: uint, minted-at: uint })
+(define-map tier-prices uint uint)
+(define-map tier-supplies uint uint)
+(define-map tier-max-supplies uint uint)
+
+(define-read-only (get-nft (id uint))
+  (map-get? nfts id)
+)
+
+(define-read-only (get-nft-owner (id uint))
+  (match (map-get? nfts id)
+    nft (ok (get owner nft))
+    (err ERR-NFT-NOT-FOUND)
+  )
+)
+
+(define-read-only (get-tier-price (tier uint))
+  (map-get? tier-prices tier)
+)
+
+(define-read-only (get-tier-supply (tier uint))
+  (ok (default-to u0 (map-get? tier-supplies tier)))
+)
+
+(define-read-only (get-next-nft-id)
+  (ok (var-get next-nft-id))
+)
+
+(define-read-only (get-base-uri)
+  (ok (var-get base-uri))
+)
+
+(define-public (set-fund-disbursement-contract (new-contract principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set fund-disbursement-contract new-contract)
+    (ok true)
+  )
+)
+
+(define-public (set-royalty-recipient (new-recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set royalty-recipient new-recipient)
+    (ok true)
+  )
+)
+
+(define-public (set-base-uri (new-uri (string-ascii 80)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set base-uri new-uri)
+    (ok true)
+  )
+)
+
+(define-public (set-tier-price (tier uint) (price uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> price u0) ERR-INSUFFICIENT-PAYMENT)
+    (map-set tier-prices tier price)
+    (ok true)
+  )
+)
+
+(define-public (set-tier-max-supply (tier uint) (max-supply uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> max-supply u0) ERR-INVALID-TIER)
+    (map-set tier-max-supplies tier max-supply)
+    (ok true)
+  )
+)
+
+(define-public (mint-nft (tier uint) (recipient principal))
+  (let (
+        (nft-id (var-get next-nft-id))
+        (price (unwrap! (map-get? tier-prices tier) ERR-INVALID-TIER))
+        (current-supply (default-to u0 (map-get? tier-supplies tier)))
+        (max-supply (unwrap! (map-get? tier-max-supplies tier) ERR-INVALID-TIER))
+        (royalty-amount (/ (* price u5) u100))
+        (treasury-amount (- price royalty-amount))
+      )
+    (asserts! (<= (+ current-supply u1) max-supply) ERR-TIER-SOLD-OUT)
+    (try! (stx-transfer? price tx-sender (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? royalty-amount tx-sender (var-get royalty-recipient))))
+    (try! (as-contract (stx-transfer? treasury-amount tx-sender (var-get fund-disbursement-contract))))
+    (map-set nfts nft-id
+      { owner: recipient, tier: tier, minted-at: block-height }
+    )
+    (map-set tier-supplies tier (+ current-supply u1))
+    (var-set next-nft-id (+ nft-id u1))
+    (print { event: "nft-minted", id: nft-id, tier: tier, to: recipient, price: price })
+    (ok nft-id)
+  )
+)
+
+(define-public (transfer-nft (nft-id uint) (recipient principal))
+  (let ((nft (unwrap! (map-get? nfts nft-id) ERR-NFT-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get owner nft)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq recipient tx-sender)) ERR-ALREADY-OWNED)
+    (map-set nfts nft-id
+      (merge nft { owner: recipient })
+    )
+    (print { event: "nft-transferred", id: nft-id, from: tx-sender, to: recipient })
+    (ok true)
+  )
+)
+
+(define-public (burn-nft (nft-id uint))
+  (let ((nft (unwrap! (map-get? nfts nft-id) ERR-NFT-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get owner nft)) ERR-NOT-AUTHORIZED)
+    (map-delete nfts nft-id)
+    (let ((tier (get tier nft)))
+      (map-set tier-supplies tier (- (default-to u0 (map-get? tier-supplies tier)) u1))
+    )
+    (print { event: "nft-burned", id: nft-id, tier: (get tier nft) })
+    (ok true)
+  )
+)
+
+(define-read-only (get-nft-uri (nft-id uint))
+  (match (map-get? nfts nft-id)
+    nft (ok (concat (var-get base-uri) (uint-to-ascii nft-id)))
+    (err ERR-NFT-NOT-FOUND)
+  )
+)
+
+(define-read-only (get-total-supply)
+  (ok (var-get next-nft-id))
+)
